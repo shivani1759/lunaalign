@@ -1012,22 +1012,75 @@ HTML_PAGE = """<!DOCTYPE html>
     function handleFile(input, target) {
       const file = input.files[0];
       if (!file) return;
+      
       const reader = new FileReader();
       reader.onload = (e) => {
-        if (target === 'a') {
-          imgAData = e.target.result;
-          const prev = document.getElementById('preview-a');
-          prev.src = imgAData;
-          prev.style.display = 'block';
-        } else {
-          imgBData = e.target.result;
-          const prev = document.getElementById('preview-b');
-          prev.src = imgBData;
-          prev.style.display = 'block';
-        }
+        const rawData = e.target.result;
+        const img = new Image();
+        img.onload = () => {
+          const maxDim = 1200;
+          let w = img.width;
+          let h = img.height;
+          if (w > maxDim || h > maxDim) {
+            if (w > h) {
+              h = Math.round(h * (maxDim / w));
+              w = maxDim;
+            } else {
+              w = Math.round(w * (maxDim / h));
+              h = maxDim;
+            }
+            const canvas = document.createElement('canvas');
+            canvas.width = w;
+            canvas.height = h;
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(img, 0, 0, w, h);
+            assignImageData(canvas.toDataURL('image/png'), target);
+          } else {
+            assignImageData(rawData, target);
+          }
+        };
+        img.onerror = () => {
+          assignImageData(rawData, target);
+        };
+        img.src = rawData;
       };
       reader.readAsDataURL(file);
     }
+
+    function assignImageData(dataUrl, target) {
+      if (target === 'a') {
+        imgAData = dataUrl;
+        const prev = document.getElementById('preview-a');
+        if (prev) {
+          prev.src = imgAData;
+          prev.style.display = 'block';
+        }
+      } else {
+        imgBData = dataUrl;
+        const prev = document.getElementById('preview-b');
+        if (prev) {
+          prev.src = imgBData;
+          prev.style.display = 'block';
+        }
+      }
+    }
+
+    document.addEventListener('DOMContentLoaded', () => {
+      ['dz-a', 'dz-b'].forEach(id => {
+        const dz = document.getElementById(id);
+        if (!dz) return;
+        const target = id === 'dz-a' ? 'a' : 'b';
+        dz.addEventListener('dragover', (e) => { e.preventDefault(); dz.style.borderColor = 'var(--accent-blue)'; });
+        dz.addEventListener('dragleave', (e) => { e.preventDefault(); dz.style.borderColor = 'var(--border-light)'; });
+        dz.addEventListener('drop', (e) => {
+          e.preventDefault();
+          dz.style.borderColor = 'var(--border-light)';
+          if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+            handleFile({ files: e.dataTransfer.files }, target);
+          }
+        });
+      });
+    });
 
     function handleDEMUpload(input) {
       const file = input.files[0];
