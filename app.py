@@ -30,7 +30,6 @@ from lunaalign.dem_raycaster import (
     create_comparison_overlay,
     create_synthetic_lunar_dem
 )
-from generate_test_data import generate_lunar_terrain
 
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="en">
@@ -225,34 +224,7 @@ HTML_PAGE = """<!DOCTYPE html>
       line-height: 1.6;
     }
 
-    /* Flat Sample Selector Bar */
-    .sample-bar {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 0.5rem 0;
-      margin-bottom: 2rem;
-      border-top: 1px solid var(--border-subtle);
-      border-bottom: 1px solid var(--border-subtle);
-    }
-    .sample-bar-label {
-      font-size: 0.88rem;
-      font-weight: 600;
-      color: #ffffff;
-      display: flex;
-      align-items: center;
-      gap: 8px;
-    }
-    .sample-bar-sub {
-      font-size: 0.8rem;
-      color: var(--text-muted);
-      font-weight: 400;
-      margin-left: 6px;
-    }
-    .sample-buttons {
-      display: flex;
-      gap: 8px;
-    }
+    
 
     /* Section Headings */
     .section-title {
@@ -658,8 +630,6 @@ HTML_PAGE = """<!DOCTYPE html>
       </nav>
 
       <div class="header-actions">
-        <button class="btn btn-ghost" onclick="loadSamplePair('same')">Same-region sample</button>
-        <button class="btn btn-ghost" onclick="loadSamplePair('diff')">Different-region sample</button>
         <button class="btn btn-primary" onclick="runRegistration()">Run registration</button>
       </div>
     </div>
@@ -677,17 +647,7 @@ HTML_PAGE = """<!DOCTYPE html>
       </p>
     </section>
 
-    <!-- Flat Test Scenarios Bar -->
-    <div class="sample-bar">
-      <div class="sample-bar-label">
-        Evaluation scenarios:
-        <span class="sample-bar-sub">Quickly test overlapping correspondence or cross-region rejection</span>
-      </div>
-      <div class="sample-buttons">
-        <button class="btn btn-subtle" onclick="loadSamplePair('same')">Load same-region</button>
-        <button class="btn btn-subtle" onclick="loadSamplePair('diff')">Load different-region</button>
-      </div>
-    </div>
+    
 
     <!-- Image Ingest Area -->
     <section class="ingest-grid">
@@ -1250,52 +1210,7 @@ HTML_PAGE = """<!DOCTYPE html>
       };
     }
 
-    async function loadSamplePair(type) {
-      showLoader(true, 'Running registration pipeline on lunar terrain sample...');
-      try {
-        const resp = await fetch('/api/sample?type=' + encodeURIComponent(type), { 
-          method: 'POST',
-          headers: { 'Accept': 'application/json' }
-        });
-        
-        const contentType = resp.headers.get('content-type') || '';
-        let data;
-        
-        if (contentType.includes('application/json')) {
-          data = await resp.json();
-        } else {
-          const rawText = await resp.text();
-          throw new Error(`Server returned non-JSON response (HTTP ${resp.status}): ${rawText.slice(0, 140)}`);
-        }
-        
-        if (!resp.ok || (data.error && data.error !== false)) {
-          const errMsg = (typeof data.error === 'string' ? data.error : data.message) || `Request failed with HTTP ${resp.status}`;
-          throw new Error(errMsg);
-        }
-        
-        imgAData = data.image_a;
-        imgBData = data.image_b;
-        
-        const prevA = document.getElementById('preview-a');
-        if (prevA && imgAData) {
-          prevA.src = imgAData;
-          prevA.style.display = 'block';
-        }
-        
-        const prevB = document.getElementById('preview-b');
-        if (prevB && imgBData) {
-          prevB.src = imgBData;
-          prevB.style.display = 'block';
-        }
-        
-        renderRegistrationResults(data.result);
-      } catch (err) {
-        console.error('Sample loading error:', err);
-        alert('Error loading sample pair: ' + err.message);
-      } finally {
-        showLoader(false);
-      }
-    }
+    
 
     async function runRegistration() {
       if (!imgAData || !imgBData) {
@@ -1571,49 +1486,7 @@ def safe_encode_image_to_base64(img) -> str:
         return ""
 
 
-def handle_sample_generation(sample_type: str):
-    """Executes procedural terrain generation and registration pipeline for sample pairs."""
-    img_a = generate_lunar_terrain(seed=42, width=800, height=800, crater_density=40)
-    
-    if sample_type == "same":
-        h, w = img_a.shape
-        center = (w // 2, h // 2)
-        M = cv2.getRotationMatrix2D(center, 12.0, 0.94)
-        M[0, 2] += 15.0
-        M[1, 2] -= 10.0
-        img_b = cv2.warpAffine(img_a, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REFLECT)
-        img_b = cv2.convertScaleAbs(img_b, alpha=1.08, beta=-5)
-        noise = np.random.normal(0, 3, img_b.shape).astype(np.float32)
-        img_b = np.clip(img_b.astype(np.float32) + noise, 0, 255).astype(np.uint8)
-    else:
-        img_b = generate_lunar_terrain(seed=999, width=800, height=800, crater_density=55)
-        
-    config = LunaAlignConfig(output_dir="results")
-    pipeline = LunaAlignPipeline(config)
-    results = pipeline.run(img_a, img_b, output_dir="results")
-    
-    match_vis = cv2.imread(results["saved_paths"]["inlier_matches"]) if "inlier_matches" in results.get("saved_paths", {}) else None
-    reg_b = cv2.imread(results["saved_paths"]["registered_image_b"]) if "registered_image_b" in results.get("saved_paths", {}) else None
-    
-    CURRENT_SESSION["image_a"] = results["preprocessed_a"]
-    CURRENT_SESSION["image_b"] = results["preprocessed_b"]
-    CURRENT_SESSION["warped_b"] = reg_b
-    CURRENT_SESSION["registered_results"] = results
-    
-    return {
-        "error": False,
-        "image_a": "data:image/png;base64," + safe_encode_image_to_base64(img_a),
-        "image_b": "data:image/png;base64," + safe_encode_image_to_base64(img_b),
-        "result": {
-            "report": results["report"],
-            "inlier_matches_b64": safe_encode_image_to_base64(match_vis),
-            "registered_b_b64": safe_encode_image_to_base64(reg_b),
-            "preview_before_a_b64": safe_encode_image_to_base64(results["preview_before_a"]),
-            "preview_after_a_b64": safe_encode_image_to_base64(results["preview_after_a"]),
-            "preview_before_b_b64": safe_encode_image_to_base64(results["preview_before_b"]),
-            "preview_after_b_b64": safe_encode_image_to_base64(results["preview_after_b"])
-        }
-    }
+
 
 
 class LunaAlignRequestHandler(BaseHTTPRequestHandler):
@@ -1647,20 +1520,7 @@ class LunaAlignRequestHandler(BaseHTTPRequestHandler):
             
             # 1. Root / UI page
             if clean_path in ("", "/", "/index.html"):
-                query = urllib.parse.parse_qs(parsed.query)
-                sample_type = query.get("autoload", [None])[0]
-                
-                page_content = HTML_PAGE
-                if sample_type in ("same", "diff"):
-                    try:
-                        sample_payload = handle_sample_generation(sample_type)
-                        clean_initial = sanitize_json_object(sample_payload)
-                        embed_script = "<script>window.INITIAL_DATA = " + json.dumps(clean_initial, cls=NumpyJSONEncoder) + "; window.addEventListener('DOMContentLoaded', () => { if (window.INITIAL_DATA) { imgAData = window.INITIAL_DATA.image_a; imgBData = window.INITIAL_DATA.image_b; const pA = document.getElementById('preview-a'); if (pA) { pA.src = imgAData; pA.style.display = 'block'; } const pB = document.getElementById('preview-b'); if (pB) { pB.src = imgBData; pB.style.display = 'block'; } renderRegistrationResults(window.INITIAL_DATA.result); } });</script>"
-                        page_content = page_content.replace("</head>", embed_script + "\n</head>")
-                    except Exception as ex:
-                        sys.stderr.write(f"Autoload sample error: {ex}\n")
-                        
-                payload = page_content.encode("utf-8")
+                payload = HTML_PAGE.encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(payload)))
@@ -1670,20 +1530,7 @@ class LunaAlignRequestHandler(BaseHTTPRequestHandler):
 
             # 2. Status check
             elif clean_path == "/api/status":
-                self.send_json_response({"status": "ready", "version": "0.8.2", "theme": "lunar-surface-dark"})
-                return
-
-            # 3. GET support for sample endpoint as safety fallback
-            elif clean_path == "/api/sample":
-                query = urllib.parse.parse_qs(parsed.query)
-                sample_type = query.get("type", ["same"])[0]
-                print(f"[API] GET /api/sample type={sample_type}")
-                try:
-                    resp_payload = handle_sample_generation(sample_type)
-                    self.send_json_response(resp_payload, status_code=200)
-                except Exception as ex:
-                    sys.stderr.write(f"[API ERROR] GET /api/sample: {ex}\n")
-                    self.send_json_response({"error": str(ex), "message": f"Sample generation failed: {str(ex)}"}, status_code=500)
+                self.send_json_response({"status": "ready", "version": "1.0.0", "theme": "lunar-surface-dark"})
                 return
 
             # 4. Unknown routes under /api/ return JSON 404
@@ -1708,32 +1555,7 @@ class LunaAlignRequestHandler(BaseHTTPRequestHandler):
             clean_path = parsed.path.rstrip("/")
             
             # 1. /api/sample
-            if clean_path == "/api/sample":
-                query = urllib.parse.parse_qs(parsed.query)
-                sample_type = query.get("type", ["same"])[0]
-                
-                # Check body for type if query parameter is empty
-                content_len = int(self.headers.get("Content-Length", 0))
-                if content_len > 0:
-                    try:
-                        body_data = json.loads(self.rfile.read(content_len).decode("utf-8"))
-                        if isinstance(body_data, dict) and "type" in body_data:
-                            sample_type = body_data["type"]
-                    except Exception:
-                        pass
-                        
-                print(f"[API] POST /api/sample type={sample_type}")
-                try:
-                    resp_payload = handle_sample_generation(sample_type)
-                    self.send_json_response(resp_payload, status_code=200)
-                    print(f"[API] POST /api/sample type={sample_type} completed (200 OK)")
-                except Exception as ex:
-                    sys.stderr.write(f"[API ERROR] POST /api/sample: {ex}\n")
-                    self.send_json_response({"error": str(ex), "message": f"Sample generation failed: {str(ex)}"}, status_code=500)
-                return
-
-            # 2. /api/align
-            elif clean_path == "/api/align":
+            if clean_path == "/api/align":
                 content_len = int(self.headers.get("Content-Length", 0))
                 if content_len <= 0 or content_len > 50 * 1024 * 1024:
                     self.send_json_response({"error": "Invalid request payload size (maximum 50MB).", "message": "Invalid request payload size"}, status_code=400)
