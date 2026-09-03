@@ -1253,15 +1253,24 @@ HTML_PAGE = """<!DOCTYPE html>
     async function loadSamplePair(type) {
       showLoader(true, 'Running registration pipeline on lunar terrain sample...');
       try {
-        const resp = await fetch('/api/sample?type=' + type, { method: 'POST' });
+        const resp = await fetch('/api/sample?type=' + encodeURIComponent(type), { 
+          method: 'POST',
+          headers: { 'Accept': 'application/json' }
+        });
+        
         const contentType = resp.headers.get('content-type') || '';
-        if (!contentType.includes('application/json')) {
-          const text = await resp.text();
-          throw new Error(`Server returned HTTP ${resp.status} (${resp.statusText}) non-JSON response.`);
+        let data;
+        
+        if (contentType.includes('application/json')) {
+          data = await resp.json();
+        } else {
+          const rawText = await resp.text();
+          throw new Error(`Server returned non-JSON response (HTTP ${resp.status}): ${rawText.slice(0, 140)}`);
         }
-        const data = await resp.json();
-        if (!resp.ok || data.error) {
-          throw new Error(data.message || data.error || `Request failed with HTTP ${resp.status}`);
+        
+        if (!resp.ok || (data.error && data.error !== false)) {
+          const errMsg = (typeof data.error === 'string' ? data.error : data.message) || `Request failed with HTTP ${resp.status}`;
+          throw new Error(errMsg);
         }
         
         imgAData = data.image_a;
@@ -1281,6 +1290,7 @@ HTML_PAGE = """<!DOCTYPE html>
         
         renderRegistrationResults(data.result);
       } catch (err) {
+        console.error('Sample loading error:', err);
         alert('Error loading sample pair: ' + err.message);
       } finally {
         showLoader(false);
@@ -1308,20 +1318,24 @@ HTML_PAGE = """<!DOCTYPE html>
       try {
         const resp = await fetch('/api/align', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
           body: JSON.stringify(payload)
         });
         const contentType = resp.headers.get('content-type') || '';
-        if (!contentType.includes('application/json')) {
-          const text = await resp.text();
-          throw new Error(`Server returned HTTP ${resp.status} (${resp.statusText}) non-JSON response.`);
+        let data;
+        if (contentType.includes('application/json')) {
+          data = await resp.json();
+        } else {
+          const rawText = await resp.text();
+          throw new Error(`Server returned non-JSON response (HTTP ${resp.status}): ${rawText.slice(0, 140)}`);
         }
-        const data = await resp.json();
-        if (!resp.ok || data.error) {
-          throw new Error(data.message || data.error || `Request failed with HTTP ${resp.status}`);
+        if (!resp.ok || (data.error && data.error !== false)) {
+          const errMsg = (typeof data.error === 'string' ? data.error : data.message) || `Request failed with HTTP ${resp.status}`;
+          throw new Error(errMsg);
         }
         renderRegistrationResults(data);
       } catch (err) {
+        console.error('Registration error:', err);
         alert('Registration failed: ' + err.message);
       } finally {
         showLoader(false);
@@ -1346,20 +1360,24 @@ HTML_PAGE = """<!DOCTYPE html>
       try {
         const resp = await fetch('/api/dem_raycast_full', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
           body: JSON.stringify(payload)
         });
         const contentType = resp.headers.get('content-type') || '';
-        if (!contentType.includes('application/json')) {
-          const text = await resp.text();
-          throw new Error(`Server returned HTTP ${resp.status} (${resp.statusText}) non-JSON response.`);
+        let data;
+        if (contentType.includes('application/json')) {
+          data = await resp.json();
+        } else {
+          const rawText = await resp.text();
+          throw new Error(`Server returned non-JSON response (HTTP ${resp.status}): ${rawText.slice(0, 140)}`);
         }
-        const data = await resp.json();
-        if (!resp.ok || data.error) {
-          throw new Error(data.message || data.error || `DEM Raycaster failed: ${data.message || data.error}`);
+        if (!resp.ok || (data.error && data.error !== false)) {
+          const errMsg = (typeof data.error === 'string' ? data.error : data.message) || `DEM Raycaster failed: HTTP ${resp.status}`;
+          throw new Error(errMsg);
         }
         renderDEMResults(data);
       } catch (err) {
+        console.error('DEM Raycaster error:', err);
         alert('DEM Raycaster request failed: ' + err.message);
       } finally {
         showLoader(false);
@@ -1553,10 +1571,56 @@ def safe_encode_image_to_base64(img) -> str:
         return ""
 
 
+def handle_sample_generation(sample_type: str):
+    """Executes procedural terrain generation and registration pipeline for sample pairs."""
+    img_a = generate_lunar_terrain(seed=42, width=800, height=800, crater_density=40)
+    
+    if sample_type == "same":
+        h, w = img_a.shape
+        center = (w // 2, h // 2)
+        M = cv2.getRotationMatrix2D(center, 12.0, 0.94)
+        M[0, 2] += 15.0
+        M[1, 2] -= 10.0
+        img_b = cv2.warpAffine(img_a, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REFLECT)
+        img_b = cv2.convertScaleAbs(img_b, alpha=1.08, beta=-5)
+        noise = np.random.normal(0, 3, img_b.shape).astype(np.float32)
+        img_b = np.clip(img_b.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+    else:
+        img_b = generate_lunar_terrain(seed=999, width=800, height=800, crater_density=55)
+        
+    config = LunaAlignConfig(output_dir="results")
+    pipeline = LunaAlignPipeline(config)
+    results = pipeline.run(img_a, img_b, output_dir="results")
+    
+    match_vis = cv2.imread(results["saved_paths"]["inlier_matches"]) if "inlier_matches" in results.get("saved_paths", {}) else None
+    reg_b = cv2.imread(results["saved_paths"]["registered_image_b"]) if "registered_image_b" in results.get("saved_paths", {}) else None
+    
+    CURRENT_SESSION["image_a"] = results["preprocessed_a"]
+    CURRENT_SESSION["image_b"] = results["preprocessed_b"]
+    CURRENT_SESSION["warped_b"] = reg_b
+    CURRENT_SESSION["registered_results"] = results
+    
+    return {
+        "error": False,
+        "image_a": "data:image/png;base64," + safe_encode_image_to_base64(img_a),
+        "image_b": "data:image/png;base64," + safe_encode_image_to_base64(img_b),
+        "result": {
+            "report": results["report"],
+            "inlier_matches_b64": safe_encode_image_to_base64(match_vis),
+            "registered_b_b64": safe_encode_image_to_base64(reg_b),
+            "preview_before_a_b64": safe_encode_image_to_base64(results["preview_before_a"]),
+            "preview_after_a_b64": safe_encode_image_to_base64(results["preview_after_a"]),
+            "preview_before_b_b64": safe_encode_image_to_base64(results["preview_before_b"]),
+            "preview_after_b_b64": safe_encode_image_to_base64(results["preview_after_b"])
+        }
+    }
+
+
 class LunaAlignRequestHandler(BaseHTTPRequestHandler):
     
     def log_message(self, format, *args):
         sys.stdout.write(f"[{self.log_date_time_string()}] {format % args}\n")
+        sys.stdout.flush()
         
     def send_json_response(self, data, status_code=200):
         """Sends a clean JSON response with guaranteed Content-Type and serialized NumPy types."""
@@ -1569,7 +1633,7 @@ class LunaAlignRequestHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(payload)
         except Exception as e:
-            err_msg = json.dumps({"error": True, "message": f"Serialization error: {str(e)}"}).encode("utf-8")
+            err_msg = json.dumps({"error": str(e), "message": f"Serialization error: {str(e)}"}).encode("utf-8")
             self.send_response(500)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(err_msg)))
@@ -1579,54 +1643,18 @@ class LunaAlignRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         try:
             parsed = urllib.parse.urlparse(self.path)
-            if parsed.path in ("/", "/index.html"):
+            clean_path = parsed.path.rstrip("/")
+            
+            # 1. Root / UI page
+            if clean_path in ("", "/", "/index.html"):
                 query = urllib.parse.parse_qs(parsed.query)
                 sample_type = query.get("autoload", [None])[0]
                 
                 page_content = HTML_PAGE
                 if sample_type in ("same", "diff"):
                     try:
-                        img_a = generate_lunar_terrain(seed=42, width=800, height=800, crater_density=40)
-                        if sample_type == "same":
-                            h, w = img_a.shape
-                            center = (w // 2, h // 2)
-                            M = cv2.getRotationMatrix2D(center, 12.0, 0.94)
-                            M[0, 2] += 15.0
-                            M[1, 2] -= 10.0
-                            img_b = cv2.warpAffine(img_a, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REFLECT)
-                            img_b = cv2.convertScaleAbs(img_b, alpha=1.08, beta=-5)
-                            noise = np.random.normal(0, 3, img_b.shape).astype(np.float32)
-                            img_b = np.clip(img_b.astype(np.float32) + noise, 0, 255).astype(np.uint8)
-                        else:
-                            img_b = generate_lunar_terrain(seed=999, width=800, height=800, crater_density=55)
-                            
-                        config = LunaAlignConfig(output_dir="results")
-                        pipeline = LunaAlignPipeline(config)
-                        results = pipeline.run(img_a, img_b, output_dir="results")
-                        
-                        match_vis = cv2.imread(results["saved_paths"]["inlier_matches"]) if "inlier_matches" in results.get("saved_paths", {}) else None
-                        reg_b = cv2.imread(results["saved_paths"]["registered_image_b"]) if "registered_image_b" in results.get("saved_paths", {}) else None
-                        
-                        CURRENT_SESSION["image_a"] = results["preprocessed_a"]
-                        CURRENT_SESSION["image_b"] = results["preprocessed_b"]
-                        CURRENT_SESSION["warped_b"] = reg_b
-                        CURRENT_SESSION["registered_results"] = results
-                        
-                        initial_data = {
-                            "image_a": "data:image/png;base64," + safe_encode_image_to_base64(img_a),
-                            "image_b": "data:image/png;base64," + safe_encode_image_to_base64(img_b),
-                            "result": {
-                                "report": results["report"],
-                                "inlier_matches_b64": safe_encode_image_to_base64(match_vis),
-                                "registered_b_b64": safe_encode_image_to_base64(reg_b),
-                                "preview_before_a_b64": safe_encode_image_to_base64(results["preview_before_a"]),
-                                "preview_after_a_b64": safe_encode_image_to_base64(results["preview_after_a"]),
-                                "preview_before_b_b64": safe_encode_image_to_base64(results["preview_before_b"]),
-                                "preview_after_b_b64": safe_encode_image_to_base64(results["preview_after_b"])
-                            }
-                        }
-                        
-                        clean_initial = sanitize_json_object(initial_data)
+                        sample_payload = handle_sample_generation(sample_type)
+                        clean_initial = sanitize_json_object(sample_payload)
                         embed_script = "<script>window.INITIAL_DATA = " + json.dumps(clean_initial, cls=NumpyJSONEncoder) + "; window.addEventListener('DOMContentLoaded', () => { if (window.INITIAL_DATA) { imgAData = window.INITIAL_DATA.image_a; imgBData = window.INITIAL_DATA.image_b; const pA = document.getElementById('preview-a'); if (pA) { pA.src = imgAData; pA.style.display = 'block'; } const pB = document.getElementById('preview-b'); if (pB) { pB.src = imgBData; pB.style.display = 'block'; } renderRegistrationResults(window.INITIAL_DATA.result); } });</script>"
                         page_content = page_content.replace("</head>", embed_script + "\n</head>")
                     except Exception as ex:
@@ -1638,75 +1666,77 @@ class LunaAlignRequestHandler(BaseHTTPRequestHandler):
                 self.send_header("Content-Length", str(len(payload)))
                 self.end_headers()
                 self.wfile.write(payload)
-            elif parsed.path == "/api/status":
-                self.send_json_response({"status": "ready", "version": "0.8.1", "theme": "lunar-surface-dark"})
+                return
+
+            # 2. Status check
+            elif clean_path == "/api/status":
+                self.send_json_response({"status": "ready", "version": "0.8.2", "theme": "lunar-surface-dark"})
+                return
+
+            # 3. GET support for sample endpoint as safety fallback
+            elif clean_path == "/api/sample":
+                query = urllib.parse.parse_qs(parsed.query)
+                sample_type = query.get("type", ["same"])[0]
+                print(f"[API] GET /api/sample type={sample_type}")
+                try:
+                    resp_payload = handle_sample_generation(sample_type)
+                    self.send_json_response(resp_payload, status_code=200)
+                except Exception as ex:
+                    sys.stderr.write(f"[API ERROR] GET /api/sample: {ex}\n")
+                    self.send_json_response({"error": str(ex), "message": f"Sample generation failed: {str(ex)}"}, status_code=500)
+                return
+
+            # 4. Unknown routes under /api/ return JSON 404
+            elif clean_path.startswith("/api"):
+                self.send_json_response({"error": f"Endpoint not found: {parsed.path}", "message": "Not Found"}, status_code=404)
+                return
+
             else:
                 self.send_response(404)
                 self.end_headers()
         except Exception as e:
-            self.send_response(500)
-            self.end_headers()
+            sys.stderr.write(f"[SERVER ERROR] do_GET: {e}\n")
+            if self.path.startswith("/api"):
+                self.send_json_response({"error": str(e), "message": "Internal Server Error"}, status_code=500)
+            else:
+                self.send_response(500)
+                self.end_headers()
 
     def do_POST(self):
         try:
             parsed = urllib.parse.urlparse(self.path)
+            clean_path = parsed.path.rstrip("/")
             
-            if parsed.path == "/api/sample":
+            # 1. /api/sample
+            if clean_path == "/api/sample":
                 query = urllib.parse.parse_qs(parsed.query)
                 sample_type = query.get("type", ["same"])[0]
                 
-                try:
-                    img_a = generate_lunar_terrain(seed=42, width=800, height=800, crater_density=40)
-                    
-                    if sample_type == "same":
-                        h, w = img_a.shape
-                        center = (w // 2, h // 2)
-                        M = cv2.getRotationMatrix2D(center, 12.0, 0.94)
-                        M[0, 2] += 15.0
-                        M[1, 2] -= 10.0
-                        img_b = cv2.warpAffine(img_a, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REFLECT)
-                        img_b = cv2.convertScaleAbs(img_b, alpha=1.08, beta=-5)
-                        noise = np.random.normal(0, 3, img_b.shape).astype(np.float32)
-                        img_b = np.clip(img_b.astype(np.float32) + noise, 0, 255).astype(np.uint8)
-                    else:
-                        img_b = generate_lunar_terrain(seed=999, width=800, height=800, crater_density=55)
+                # Check body for type if query parameter is empty
+                content_len = int(self.headers.get("Content-Length", 0))
+                if content_len > 0:
+                    try:
+                        body_data = json.loads(self.rfile.read(content_len).decode("utf-8"))
+                        if isinstance(body_data, dict) and "type" in body_data:
+                            sample_type = body_data["type"]
+                    except Exception:
+                        pass
                         
-                    config = LunaAlignConfig(output_dir="results")
-                    pipeline = LunaAlignPipeline(config)
-                    results = pipeline.run(img_a, img_b, output_dir="results")
-                    
-                    match_vis = cv2.imread(results["saved_paths"]["inlier_matches"]) if "inlier_matches" in results.get("saved_paths", {}) else None
-                    reg_b = cv2.imread(results["saved_paths"]["registered_image_b"]) if "registered_image_b" in results.get("saved_paths", {}) else None
-                    
-                    CURRENT_SESSION["image_a"] = results["preprocessed_a"]
-                    CURRENT_SESSION["image_b"] = results["preprocessed_b"]
-                    CURRENT_SESSION["warped_b"] = reg_b
-                    CURRENT_SESSION["registered_results"] = results
-                    
-                    resp_payload = {
-                        "error": False,
-                        "image_a": "data:image/png;base64," + safe_encode_image_to_base64(img_a),
-                        "image_b": "data:image/png;base64," + safe_encode_image_to_base64(img_b),
-                        "result": {
-                            "report": results["report"],
-                            "inlier_matches_b64": safe_encode_image_to_base64(match_vis),
-                            "registered_b_b64": safe_encode_image_to_base64(reg_b),
-                            "preview_before_a_b64": safe_encode_image_to_base64(results["preview_before_a"]),
-                            "preview_after_a_b64": safe_encode_image_to_base64(results["preview_after_a"]),
-                            "preview_before_b_b64": safe_encode_image_to_base64(results["preview_before_b"]),
-                            "preview_after_b_b64": safe_encode_image_to_base64(results["preview_after_b"])
-                        }
-                    }
+                print(f"[API] POST /api/sample type={sample_type}")
+                try:
+                    resp_payload = handle_sample_generation(sample_type)
                     self.send_json_response(resp_payload, status_code=200)
+                    print(f"[API] POST /api/sample type={sample_type} completed (200 OK)")
                 except Exception as ex:
-                    sys.stderr.write(f"Sample generation error: {ex}\n")
-                    self.send_json_response({"error": True, "message": f"Sample generation failed: {str(ex)}"}, status_code=500)
+                    sys.stderr.write(f"[API ERROR] POST /api/sample: {ex}\n")
+                    self.send_json_response({"error": str(ex), "message": f"Sample generation failed: {str(ex)}"}, status_code=500)
                 return
 
-            elif parsed.path == "/api/align":
+            # 2. /api/align
+            elif clean_path == "/api/align":
                 content_len = int(self.headers.get("Content-Length", 0))
                 if content_len <= 0 or content_len > 50 * 1024 * 1024:
-                    self.send_json_response({"error": True, "message": "Invalid request payload size (maximum 50MB)."}, status_code=400)
+                    self.send_json_response({"error": "Invalid request payload size (maximum 50MB).", "message": "Invalid request payload size"}, status_code=400)
                     return
                     
                 body = self.rfile.read(content_len).decode("utf-8")
@@ -1750,13 +1780,14 @@ class LunaAlignRequestHandler(BaseHTTPRequestHandler):
                     }
                     self.send_json_response(resp, status_code=200)
                 except ValueError as ve:
-                    self.send_json_response({"error": True, "message": str(ve)}, status_code=400)
+                    self.send_json_response({"error": str(ve), "message": str(ve)}, status_code=400)
                 except Exception as e:
-                    sys.stderr.write(f"Alignment pipeline error: {e}\n")
-                    self.send_json_response({"error": True, "message": f"Pipeline processing error: {str(e)}"}, status_code=500)
+                    sys.stderr.write(f"[API ERROR] /api/align: {e}\n")
+                    self.send_json_response({"error": str(e), "message": f"Pipeline processing error: {str(e)}"}, status_code=500)
                 return
 
-            elif parsed.path == "/api/dem_raycast_full":
+            # 3. /api/dem_raycast_full
+            elif clean_path == "/api/dem_raycast_full":
                 content_len = int(self.headers.get("Content-Length", 0))
                 body = self.rfile.read(content_len).decode("utf-8")
                 
@@ -1846,16 +1877,17 @@ class LunaAlignRequestHandler(BaseHTTPRequestHandler):
                     }
                     self.send_json_response(resp, status_code=200)
                 except ValueError as ve:
-                    self.send_json_response({"error": True, "message": str(ve)}, status_code=400)
+                    self.send_json_response({"error": str(ve), "message": str(ve)}, status_code=400)
                 except Exception as e:
-                    sys.stderr.write(f"DEM Raycaster error: {e}\n")
-                    self.send_json_response({"error": True, "message": f"DEM Raycaster error: {str(e)}"}, status_code=500)
+                    sys.stderr.write(f"[API ERROR] /api/dem_raycast_full: {e}\n")
+                    self.send_json_response({"error": str(e), "message": f"DEM Raycaster error: {str(e)}"}, status_code=500)
                 return
 
-            self.send_json_response({"error": True, "message": "Not Found"}, status_code=404)
+            # Unknown API routes return JSON 404
+            self.send_json_response({"error": f"Endpoint not found: {parsed.path}", "message": "Not Found"}, status_code=404)
         except Exception as top_err:
-            sys.stderr.write(f"Unhandled request error: {top_err}\n")
-            self.send_json_response({"error": True, "message": "Internal Server Error"}, status_code=500)
+            sys.stderr.write(f"[SERVER TOP-LEVEL ERROR] do_POST: {top_err}\n")
+            self.send_json_response({"error": str(top_err), "message": "Internal Server Error"}, status_code=500)
 
 
 def run_server(port: int = 8080, host: str = "0.0.0.0"):
