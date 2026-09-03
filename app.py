@@ -1254,18 +1254,30 @@ HTML_PAGE = """<!DOCTYPE html>
       showLoader(true, 'Running registration pipeline on lunar terrain sample...');
       try {
         const resp = await fetch('/api/sample?type=' + type, { method: 'POST' });
+        const contentType = resp.headers.get('content-type') || '';
+        if (!contentType.includes('application/json')) {
+          const text = await resp.text();
+          throw new Error(`Server returned HTTP ${resp.status} (${resp.statusText}) non-JSON response.`);
+        }
         const data = await resp.json();
+        if (!resp.ok || data.error) {
+          throw new Error(data.message || data.error || `Request failed with HTTP ${resp.status}`);
+        }
         
         imgAData = data.image_a;
         imgBData = data.image_b;
         
         const prevA = document.getElementById('preview-a');
-        prevA.src = imgAData;
-        prevA.style.display = 'block';
+        if (prevA && imgAData) {
+          prevA.src = imgAData;
+          prevA.style.display = 'block';
+        }
         
         const prevB = document.getElementById('preview-b');
-        prevB.src = imgBData;
-        prevB.style.display = 'block';
+        if (prevB && imgBData) {
+          prevB.src = imgBData;
+          prevB.style.display = 'block';
+        }
         
         renderRegistrationResults(data.result);
       } catch (err) {
@@ -1299,14 +1311,18 @@ HTML_PAGE = """<!DOCTYPE html>
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload)
         });
-        const data = await resp.json();
-        if (data.error) {
-          alert('Pipeline error: ' + data.error);
-        } else {
-          renderRegistrationResults(data);
+        const contentType = resp.headers.get('content-type') || '';
+        if (!contentType.includes('application/json')) {
+          const text = await resp.text();
+          throw new Error(`Server returned HTTP ${resp.status} (${resp.statusText}) non-JSON response.`);
         }
+        const data = await resp.json();
+        if (!resp.ok || data.error) {
+          throw new Error(data.message || data.error || `Request failed with HTTP ${resp.status}`);
+        }
+        renderRegistrationResults(data);
       } catch (err) {
-        alert('Request failed: ' + err.message);
+        alert('Registration failed: ' + err.message);
       } finally {
         showLoader(false);
       }
@@ -1333,12 +1349,16 @@ HTML_PAGE = """<!DOCTYPE html>
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload)
         });
-        const data = await resp.json();
-        if (data.error) {
-          alert('DEM Raycaster error: ' + data.error);
-        } else {
-          renderDEMResults(data);
+        const contentType = resp.headers.get('content-type') || '';
+        if (!contentType.includes('application/json')) {
+          const text = await resp.text();
+          throw new Error(`Server returned HTTP ${resp.status} (${resp.statusText}) non-JSON response.`);
         }
+        const data = await resp.json();
+        if (!resp.ok || data.error) {
+          throw new Error(data.message || data.error || `DEM Raycaster failed: ${data.message || data.error}`);
+        }
+        renderDEMResults(data);
       } catch (err) {
         alert('DEM Raycaster request failed: ' + err.message);
       } finally {
@@ -1475,279 +1495,367 @@ CURRENT_SESSION = {
 }
 
 
+
+class NumpyJSONEncoder(json.JSONEncoder):
+    """Universal JSON encoder supporting all NumPy numeric, boolean, and array types."""
+    def default(self, obj):
+        if isinstance(obj, (np.integer, np.int64, np.int32, np.int16, np.int8, np.uint8)):
+            return int(obj)
+        elif isinstance(obj, (np.floating, np.float64, np.float32, np.float16)):
+            if np.isnan(obj) or np.isinf(obj):
+                return None
+            return float(obj)
+        elif isinstance(obj, (np.bool_, bool)):
+            return bool(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, (bytes, bytearray)):
+            return base64.b64encode(obj).decode("utf-8")
+        elif hasattr(obj, "__dict__"):
+            return obj.__dict__
+        return super().default(obj)
+
+
+def sanitize_json_object(obj):
+    """Recursively converts all NumPy and complex types into standard Python primitives."""
+    if isinstance(obj, dict):
+        return {str(k): sanitize_json_object(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple, set)):
+        return [sanitize_json_object(x) for x in obj]
+    elif isinstance(obj, (np.integer, np.int64, np.int32, np.int16, np.int8, np.uint8)):
+        return int(obj)
+    elif isinstance(obj, (np.floating, np.float64, np.float32, np.float16)):
+        if np.isnan(obj) or np.isinf(obj):
+            return None
+        return float(obj)
+    elif isinstance(obj, (np.bool_, bool)):
+        return bool(obj)
+    elif isinstance(obj, np.ndarray):
+        return sanitize_json_object(obj.tolist())
+    elif isinstance(obj, (bytes, bytearray)):
+        return base64.b64encode(obj).decode("utf-8")
+    elif obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+    else:
+        return str(obj)
+
+
+def safe_encode_image_to_base64(img) -> str:
+    """Encodes a NumPy image into a Base64 PNG string safely without raising exceptions."""
+    if img is None or not isinstance(img, np.ndarray) or img.size == 0:
+        return ""
+    try:
+        success, buffer = cv2.imencode(".png", img)
+        if not success:
+            return ""
+        return base64.b64encode(buffer).decode("utf-8")
+    except Exception:
+        return ""
+
+
 class LunaAlignRequestHandler(BaseHTTPRequestHandler):
     
     def log_message(self, format, *args):
         sys.stdout.write(f"[{self.log_date_time_string()}] {format % args}\n")
         
+    def send_json_response(self, data, status_code=200):
+        """Sends a clean JSON response with guaranteed Content-Type and serialized NumPy types."""
+        try:
+            clean_data = sanitize_json_object(data)
+            payload = json.dumps(clean_data, cls=NumpyJSONEncoder).encode("utf-8")
+            self.send_response(status_code)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+        except Exception as e:
+            err_msg = json.dumps({"error": True, "message": f"Serialization error: {str(e)}"}).encode("utf-8")
+            self.send_response(500)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(err_msg)))
+            self.end_headers()
+            self.wfile.write(err_msg)
+
     def do_GET(self):
-        parsed = urllib.parse.urlparse(self.path)
-        if parsed.path in ("/", "/index.html"):
-            query = urllib.parse.parse_qs(parsed.query)
-            sample_type = query.get("autoload", [None])[0]
-            
-            page_content = HTML_PAGE
-            if sample_type in ("same", "diff"):
-                img_a = generate_lunar_terrain(seed=42, width=800, height=800, crater_density=40)
-                if sample_type == "same":
-                    h, w = img_a.shape
-                    center = (w // 2, h // 2)
-                    M = cv2.getRotationMatrix2D(center, 12.0, 0.94)
-                    M[0, 2] += 15.0
-                    M[1, 2] -= 10.0
-                    img_b = cv2.warpAffine(img_a, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REFLECT)
-                    img_b = cv2.convertScaleAbs(img_b, alpha=1.08, beta=-5)
-                    noise = np.random.normal(0, 3, img_b.shape).astype(np.float32)
-                    img_b = np.clip(img_b.astype(np.float32) + noise, 0, 255).astype(np.uint8)
-                else:
-                    img_b = generate_lunar_terrain(seed=999, width=800, height=800, crater_density=55)
-                    
-                config = LunaAlignConfig(output_dir="results")
-                pipeline = LunaAlignPipeline(config)
-                results = pipeline.run(img_a, img_b, output_dir="results")
+        try:
+            parsed = urllib.parse.urlparse(self.path)
+            if parsed.path in ("/", "/index.html"):
+                query = urllib.parse.parse_qs(parsed.query)
+                sample_type = query.get("autoload", [None])[0]
                 
-                match_vis = cv2.imread(results["saved_paths"]["inlier_matches"])
-                reg_b = cv2.imread(results["saved_paths"]["registered_image_b"])
-                
-                CURRENT_SESSION["image_a"] = results["preprocessed_a"]
-                CURRENT_SESSION["image_b"] = results["preprocessed_b"]
-                CURRENT_SESSION["warped_b"] = reg_b
-                CURRENT_SESSION["registered_results"] = results
-                
-                initial_data = {
-                    "image_a": "data:image/png;base64," + encode_image_to_base64(img_a),
-                    "image_b": "data:image/png;base64," + encode_image_to_base64(img_b),
-                    "result": {
-                        "report": results["report"],
-                        "inlier_matches_b64": encode_image_to_base64(match_vis),
-                        "registered_b_b64": encode_image_to_base64(reg_b),
-                        "preview_before_a_b64": encode_image_to_base64(results["preview_before_a"]),
-                        "preview_after_a_b64": encode_image_to_base64(results["preview_after_a"]),
-                        "preview_before_b_b64": encode_image_to_base64(results["preview_before_b"]),
-                        "preview_after_b_b64": encode_image_to_base64(results["preview_after_b"])
-                    }
-                }
-                
-                embed_script = "<script>window.INITIAL_DATA = " + json.dumps(initial_data) + "; window.addEventListener('DOMContentLoaded', () => { if (window.INITIAL_DATA) { imgAData = window.INITIAL_DATA.image_a; imgBData = window.INITIAL_DATA.image_b; const pA = document.getElementById('preview-a'); if (pA) { pA.src = imgAData; pA.style.display = 'block'; } const pB = document.getElementById('preview-b'); if (pB) { pB.src = imgBData; pB.style.display = 'block'; } renderRegistrationResults(window.INITIAL_DATA.result); } });</script>"
-                page_content = page_content.replace("</head>", embed_script + "\n</head>")
-                
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(page_content.encode("utf-8"))
-        elif parsed.path == "/api/status":
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps({"status": "ready", "version": "0.8.0", "theme": "lunar-surface-dark"}).encode("utf-8"))
-        else:
-            self.send_response(404)
+                page_content = HTML_PAGE
+                if sample_type in ("same", "diff"):
+                    try:
+                        img_a = generate_lunar_terrain(seed=42, width=800, height=800, crater_density=40)
+                        if sample_type == "same":
+                            h, w = img_a.shape
+                            center = (w // 2, h // 2)
+                            M = cv2.getRotationMatrix2D(center, 12.0, 0.94)
+                            M[0, 2] += 15.0
+                            M[1, 2] -= 10.0
+                            img_b = cv2.warpAffine(img_a, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REFLECT)
+                            img_b = cv2.convertScaleAbs(img_b, alpha=1.08, beta=-5)
+                            noise = np.random.normal(0, 3, img_b.shape).astype(np.float32)
+                            img_b = np.clip(img_b.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+                        else:
+                            img_b = generate_lunar_terrain(seed=999, width=800, height=800, crater_density=55)
+                            
+                        config = LunaAlignConfig(output_dir="results")
+                        pipeline = LunaAlignPipeline(config)
+                        results = pipeline.run(img_a, img_b, output_dir="results")
+                        
+                        match_vis = cv2.imread(results["saved_paths"]["inlier_matches"]) if "inlier_matches" in results.get("saved_paths", {}) else None
+                        reg_b = cv2.imread(results["saved_paths"]["registered_image_b"]) if "registered_image_b" in results.get("saved_paths", {}) else None
+                        
+                        CURRENT_SESSION["image_a"] = results["preprocessed_a"]
+                        CURRENT_SESSION["image_b"] = results["preprocessed_b"]
+                        CURRENT_SESSION["warped_b"] = reg_b
+                        CURRENT_SESSION["registered_results"] = results
+                        
+                        initial_data = {
+                            "image_a": "data:image/png;base64," + safe_encode_image_to_base64(img_a),
+                            "image_b": "data:image/png;base64," + safe_encode_image_to_base64(img_b),
+                            "result": {
+                                "report": results["report"],
+                                "inlier_matches_b64": safe_encode_image_to_base64(match_vis),
+                                "registered_b_b64": safe_encode_image_to_base64(reg_b),
+                                "preview_before_a_b64": safe_encode_image_to_base64(results["preview_before_a"]),
+                                "preview_after_a_b64": safe_encode_image_to_base64(results["preview_after_a"]),
+                                "preview_before_b_b64": safe_encode_image_to_base64(results["preview_before_b"]),
+                                "preview_after_b_b64": safe_encode_image_to_base64(results["preview_after_b"])
+                            }
+                        }
+                        
+                        clean_initial = sanitize_json_object(initial_data)
+                        embed_script = "<script>window.INITIAL_DATA = " + json.dumps(clean_initial, cls=NumpyJSONEncoder) + "; window.addEventListener('DOMContentLoaded', () => { if (window.INITIAL_DATA) { imgAData = window.INITIAL_DATA.image_a; imgBData = window.INITIAL_DATA.image_b; const pA = document.getElementById('preview-a'); if (pA) { pA.src = imgAData; pA.style.display = 'block'; } const pB = document.getElementById('preview-b'); if (pB) { pB.src = imgBData; pB.style.display = 'block'; } renderRegistrationResults(window.INITIAL_DATA.result); } });</script>"
+                        page_content = page_content.replace("</head>", embed_script + "\n</head>")
+                    except Exception as ex:
+                        sys.stderr.write(f"Autoload sample error: {ex}\n")
+                        
+                payload = page_content.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+            elif parsed.path == "/api/status":
+                self.send_json_response({"status": "ready", "version": "0.8.1", "theme": "lunar-surface-dark"})
+            else:
+                self.send_response(404)
+                self.end_headers()
+        except Exception as e:
+            self.send_response(500)
             self.end_headers()
 
     def do_POST(self):
-        parsed = urllib.parse.urlparse(self.path)
-        
-        if parsed.path == "/api/sample":
-            query = urllib.parse.parse_qs(parsed.query)
-            sample_type = query.get("type", ["same"])[0]
+        try:
+            parsed = urllib.parse.urlparse(self.path)
             
-            img_a = generate_lunar_terrain(seed=42, width=800, height=800, crater_density=40)
-            
-            if sample_type == "same":
-                h, w = img_a.shape
-                center = (w // 2, h // 2)
-                M = cv2.getRotationMatrix2D(center, 12.0, 0.94)
-                M[0, 2] += 15.0
-                M[1, 2] -= 10.0
-                img_b = cv2.warpAffine(img_a, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REFLECT)
-                img_b = cv2.convertScaleAbs(img_b, alpha=1.08, beta=-5)
-                noise = np.random.normal(0, 3, img_b.shape).astype(np.float32)
-                img_b = np.clip(img_b.astype(np.float32) + noise, 0, 255).astype(np.uint8)
-            else:
-                img_b = generate_lunar_terrain(seed=999, width=800, height=800, crater_density=55)
+            if parsed.path == "/api/sample":
+                query = urllib.parse.parse_qs(parsed.query)
+                sample_type = query.get("type", ["same"])[0]
                 
-            config = LunaAlignConfig(output_dir="results")
-            pipeline = LunaAlignPipeline(config)
-            results = pipeline.run(img_a, img_b, output_dir="results")
-            
-            match_vis = cv2.imread(results["saved_paths"]["inlier_matches"])
-            reg_b = cv2.imread(results["saved_paths"]["registered_image_b"])
-            
-            CURRENT_SESSION["image_a"] = results["preprocessed_a"]
-            CURRENT_SESSION["image_b"] = results["preprocessed_b"]
-            CURRENT_SESSION["warped_b"] = reg_b
-            CURRENT_SESSION["registered_results"] = results
-            
-            resp_payload = {
-                "image_a": "data:image/png;base64," + encode_image_to_base64(img_a),
-                "image_b": "data:image/png;base64," + encode_image_to_base64(img_b),
-                "result": {
-                    "report": results["report"],
-                    "inlier_matches_b64": encode_image_to_base64(match_vis),
-                    "registered_b_b64": encode_image_to_base64(reg_b),
-                    "preview_before_a_b64": encode_image_to_base64(results["preview_before_a"]),
-                    "preview_after_a_b64": encode_image_to_base64(results["preview_after_a"]),
-                    "preview_before_b_b64": encode_image_to_base64(results["preview_before_b"]),
-                    "preview_after_b_b64": encode_image_to_base64(results["preview_after_b"])
-                }
-            }
-            
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps(resp_payload).encode("utf-8"))
-            return
+                try:
+                    img_a = generate_lunar_terrain(seed=42, width=800, height=800, crater_density=40)
+                    
+                    if sample_type == "same":
+                        h, w = img_a.shape
+                        center = (w // 2, h // 2)
+                        M = cv2.getRotationMatrix2D(center, 12.0, 0.94)
+                        M[0, 2] += 15.0
+                        M[1, 2] -= 10.0
+                        img_b = cv2.warpAffine(img_a, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REFLECT)
+                        img_b = cv2.convertScaleAbs(img_b, alpha=1.08, beta=-5)
+                        noise = np.random.normal(0, 3, img_b.shape).astype(np.float32)
+                        img_b = np.clip(img_b.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+                    else:
+                        img_b = generate_lunar_terrain(seed=999, width=800, height=800, crater_density=55)
+                        
+                    config = LunaAlignConfig(output_dir="results")
+                    pipeline = LunaAlignPipeline(config)
+                    results = pipeline.run(img_a, img_b, output_dir="results")
+                    
+                    match_vis = cv2.imread(results["saved_paths"]["inlier_matches"]) if "inlier_matches" in results.get("saved_paths", {}) else None
+                    reg_b = cv2.imread(results["saved_paths"]["registered_image_b"]) if "registered_image_b" in results.get("saved_paths", {}) else None
+                    
+                    CURRENT_SESSION["image_a"] = results["preprocessed_a"]
+                    CURRENT_SESSION["image_b"] = results["preprocessed_b"]
+                    CURRENT_SESSION["warped_b"] = reg_b
+                    CURRENT_SESSION["registered_results"] = results
+                    
+                    resp_payload = {
+                        "error": False,
+                        "image_a": "data:image/png;base64," + safe_encode_image_to_base64(img_a),
+                        "image_b": "data:image/png;base64," + safe_encode_image_to_base64(img_b),
+                        "result": {
+                            "report": results["report"],
+                            "inlier_matches_b64": safe_encode_image_to_base64(match_vis),
+                            "registered_b_b64": safe_encode_image_to_base64(reg_b),
+                            "preview_before_a_b64": safe_encode_image_to_base64(results["preview_before_a"]),
+                            "preview_after_a_b64": safe_encode_image_to_base64(results["preview_after_a"]),
+                            "preview_before_b_b64": safe_encode_image_to_base64(results["preview_before_b"]),
+                            "preview_after_b_b64": safe_encode_image_to_base64(results["preview_after_b"])
+                        }
+                    }
+                    self.send_json_response(resp_payload, status_code=200)
+                except Exception as ex:
+                    sys.stderr.write(f"Sample generation error: {ex}\n")
+                    self.send_json_response({"error": True, "message": f"Sample generation failed: {str(ex)}"}, status_code=500)
+                return
 
-        elif parsed.path == "/api/align":
-            content_len = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(content_len).decode("utf-8")
-            
-            try:
-                data = json.loads(body)
-                img_a = decode_image_from_base64(data["image_a"])
-                img_b = decode_image_from_base64(data["image_b"])
+            elif parsed.path == "/api/align":
+                content_len = int(self.headers.get("Content-Length", 0))
+                if content_len <= 0 or content_len > 50 * 1024 * 1024:
+                    self.send_json_response({"error": True, "message": "Invalid request payload size (maximum 50MB)."}, status_code=400)
+                    return
+                    
+                body = self.rfile.read(content_len).decode("utf-8")
                 
-                config = LunaAlignConfig(
-                    feature_type=data.get("detector", "AUTO"),
-                    illumination_mode=data.get("illumination_mode", "AUTO"),
-                    enable_subpixel=bool(data.get("subpixel_enabled", True)),
-                    min_candidate_matches=int(data.get("min_candidate_matches", 30)),
-                    min_inliers=int(data.get("min_inliers", 20)),
-                    min_inlier_ratio=float(data.get("min_ratio", 0.25)),
-                    max_rmse_px=float(data.get("max_rmse", 3.5)),
-                    output_dir="results"
-                )
-                
-                pipeline = LunaAlignPipeline(config)
-                results = pipeline.run(img_a, img_b, output_dir="results")
-                
-                match_vis = cv2.imread(results["saved_paths"]["inlier_matches"])
-                reg_b = cv2.imread(results["saved_paths"]["registered_image_b"])
-                
-                CURRENT_SESSION["image_a"] = results["preprocessed_a"]
-                CURRENT_SESSION["image_b"] = results["preprocessed_b"]
-                CURRENT_SESSION["warped_b"] = reg_b
-                CURRENT_SESSION["registered_results"] = results
-                
-                resp = {
-                    "report": results["report"],
-                    "inlier_matches_b64": encode_image_to_base64(match_vis),
-                    "registered_b_b64": encode_image_to_base64(reg_b),
-                    "preview_before_a_b64": encode_image_to_base64(results["preview_before_a"]),
-                    "preview_after_a_b64": encode_image_to_base64(results["preview_after_a"]),
-                    "preview_before_b_b64": encode_image_to_base64(results["preview_before_b"]),
-                    "preview_after_b_b64": encode_image_to_base64(results["preview_after_b"])
-                }
-                
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(json.dumps(resp).encode("utf-8"))
-            except Exception as e:
-                self.send_response(500)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(json.dumps({"error": str(e)}).encode("utf-8"))
-            return
+                try:
+                    data = json.loads(body)
+                    img_a = decode_image_from_base64(data.get("image_a"))
+                    img_b = decode_image_from_base64(data.get("image_b"))
+                    
+                    config = LunaAlignConfig(
+                        feature_type=data.get("detector", "AUTO"),
+                        illumination_mode=data.get("illumination_mode", "AUTO"),
+                        enable_subpixel=bool(data.get("subpixel_enabled", True)),
+                        min_candidate_matches=int(data.get("min_candidate_matches", 30)),
+                        min_inliers=int(data.get("min_inliers", 20)),
+                        min_inlier_ratio=float(data.get("min_ratio", 0.25)),
+                        max_rmse_px=float(data.get("max_rmse", 3.5)),
+                        output_dir="results"
+                    )
+                    
+                    pipeline = LunaAlignPipeline(config)
+                    results = pipeline.run(img_a, img_b, output_dir="results")
+                    
+                    match_vis = cv2.imread(results["saved_paths"]["inlier_matches"]) if "inlier_matches" in results.get("saved_paths", {}) else None
+                    reg_b = cv2.imread(results["saved_paths"]["registered_image_b"]) if "registered_image_b" in results.get("saved_paths", {}) else None
+                    
+                    CURRENT_SESSION["image_a"] = results["preprocessed_a"]
+                    CURRENT_SESSION["image_b"] = results["preprocessed_b"]
+                    CURRENT_SESSION["warped_b"] = reg_b
+                    CURRENT_SESSION["registered_results"] = results
+                    
+                    resp = {
+                        "error": False,
+                        "report": results["report"],
+                        "inlier_matches_b64": safe_encode_image_to_base64(match_vis),
+                        "registered_b_b64": safe_encode_image_to_base64(reg_b),
+                        "preview_before_a_b64": safe_encode_image_to_base64(results["preview_before_a"]),
+                        "preview_after_a_b64": safe_encode_image_to_base64(results["preview_after_a"]),
+                        "preview_before_b_b64": safe_encode_image_to_base64(results["preview_before_b"]),
+                        "preview_after_b_b64": safe_encode_image_to_base64(results["preview_after_b"])
+                    }
+                    self.send_json_response(resp, status_code=200)
+                except ValueError as ve:
+                    self.send_json_response({"error": True, "message": str(ve)}, status_code=400)
+                except Exception as e:
+                    sys.stderr.write(f"Alignment pipeline error: {e}\n")
+                    self.send_json_response({"error": True, "message": f"Pipeline processing error: {str(e)}"}, status_code=500)
+                return
 
-        elif parsed.path == "/api/dem_raycast_full":
-            content_len = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(content_len).decode("utf-8")
-            
-            try:
-                data = json.loads(body)
-                dem_mode = data.get("dem_mode", "real")
-                azimuth_deg = float(data.get("azimuth", 126.0))
-                elevation_deg = float(data.get("elevation", 14.0))
+            elif parsed.path == "/api/dem_raycast_full":
+                content_len = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(content_len).decode("utf-8")
                 
-                img_a = CURRENT_SESSION.get("image_a")
-                warped_b = CURRENT_SESSION.get("warped_b")
-                
-                if img_a is None:
-                    raise ValueError("Registration session not found. Please run image registration first.")
+                try:
+                    data = json.loads(body)
+                    dem_mode = data.get("dem_mode", "real")
+                    azimuth_deg = float(data.get("azimuth", 126.0))
+                    elevation_deg = float(data.get("elevation", 14.0))
                     
-                h_a, w_a = img_a.shape[:2]
-                
-                is_demo = (dem_mode == "demo" or not data.get("dem_data"))
-                if is_demo:
-                    raw_dem = create_synthetic_lunar_dem(width=w_a, height=h_a, crater_count=35, seed=42)
-                    dem_meta = {"georeferenced": False, "dtype": "float32", "is_demo": True}
-                else:
-                    dem_bytes = base64.b64decode(data["dem_data"].split(",", 1)[1] if "," in data["dem_data"] else data["dem_data"])
-                    raw_dem, dem_meta = load_dem(dem_bytes)
-                    dem_meta["is_demo"] = False
+                    img_a = CURRENT_SESSION.get("image_a")
+                    warped_b = CURRENT_SESSION.get("warped_b")
                     
-                aligned_dem, align_info = align_dem_to_reference_grid(raw_dem, None, (h_a, w_a))
-                if is_demo:
-                    align_info["status"] = "Demo mode (Synthetic terrain illustration)"
-                    align_info["status_badge"] = "Demo only"
-                    align_info["warning"] = "DEMO ONLY — NOT DERIVED FROM THE REGISTERED LUNAR TERRAIN"
+                    if img_a is None:
+                        raise ValueError("Registration session not found. Please run image registration first.")
+                        
+                    h_a, w_a = img_a.shape[:2]
                     
-                normals = compute_surface_normals(aligned_dem, pixel_resolution_m=10.0)
-                sun_vec = sun_vector_from_angles(azimuth_deg, elevation_deg)
-                illumination = compute_lambertian_illumination(normals, sun_vec)
-                shadow_mask = compute_terrain_shadows(aligned_dem, sun_vec, pixel_resolution_m=10.0)
-                simulated_image = render_raycaster_result(illumination, shadow_mask)
-                
-                comparison_metrics = compare_with_registered_images(simulated_image, img_a, warped_b, shadow_mask)
-                
-                color_dem = create_colorized_dem(aligned_dem)
-                shadow_vis = (shadow_mask * 255.0).astype(np.uint8)
-                overlay_vis = create_comparison_overlay(img_a, simulated_image, "Image A (Ref)", "DEM Simulation")
-                comp_b_vis = create_comparison_overlay(warped_b, simulated_image, "Warped Image B", "DEM Simulation")
-                
-                solar_report = {
-                    "module": "DEM-Based Solar Raycaster",
-                    "dem_status": align_info["status"],
-                    "is_demo": is_demo,
-                    "sun_azimuth_deg": round(azimuth_deg, 1),
-                    "sun_elevation_deg": round(elevation_deg, 1),
-                    "simulation_model": "Lambertian + terrain shadows",
-                    "similarity_with_image_a": comparison_metrics["similarity_image_a"],
-                    "similarity_with_warped_b": comparison_metrics["similarity_warped_b"],
-                    "shadow_overlap_score_pct": comparison_metrics["shadow_overlap_pct"],
-                    "mean_brightness_diff": comparison_metrics["mean_brightness_diff"],
-                    "interpretation": comparison_metrics["interpretation"],
-                    "alignment_warning": align_info["warning"]
-                }
-                
-                out_dir = CURRENT_SESSION.get("output_dir", "results")
-                os.makedirs(out_dir, exist_ok=True)
-                
-                cv2.imwrite(os.path.join(out_dir, "dem_aligned_to_reference.png"), color_dem)
-                cv2.imwrite(os.path.join(out_dir, "simulated_illumination.png"), simulated_image)
-                cv2.imwrite(os.path.join(out_dir, "simulated_shadow_mask.png"), shadow_vis)
-                cv2.imwrite(os.path.join(out_dir, "comparison_with_image_a.png"), overlay_vis)
-                cv2.imwrite(os.path.join(out_dir, "comparison_with_registered_b.png"), comp_b_vis)
-                
-                with open(os.path.join(out_dir, "solar_raycaster_report.json"), "w", encoding="utf-8") as f:
-                    json.dump(solar_report, f, indent=2)
+                    is_demo = (dem_mode == "demo" or not data.get("dem_data"))
+                    if is_demo:
+                        raw_dem = create_synthetic_lunar_dem(width=w_a, height=h_a, crater_count=35, seed=42)
+                        dem_meta = {"georeferenced": False, "dtype": "float32", "is_demo": True}
+                    else:
+                        dem_b64 = data.get("dem_data", "")
+                        if "," in dem_b64:
+                            dem_b64 = dem_b64.split(",", 1)[1]
+                        dem_bytes = base64.b64decode(dem_b64)
+                        raw_dem, dem_meta = load_dem(dem_bytes)
+                        dem_meta["is_demo"] = False
+                        
+                    aligned_dem, align_info = align_dem_to_reference_grid(raw_dem, None, (h_a, w_a))
+                    if is_demo:
+                        align_info["status"] = "Demo mode (Synthetic terrain illustration)"
+                        align_info["status_badge"] = "Demo only"
+                        align_info["warning"] = "DEMO ONLY — NOT DERIVED FROM THE REGISTERED LUNAR TERRAIN"
+                        
+                    normals = compute_surface_normals(aligned_dem, pixel_resolution_m=10.0)
+                    sun_vec = sun_vector_from_angles(azimuth_deg, elevation_deg)
+                    illumination = compute_lambertian_illumination(normals, sun_vec)
+                    shadow_mask = compute_terrain_shadows(aligned_dem, sun_vec, pixel_resolution_m=10.0)
+                    simulated_image = render_raycaster_result(illumination, shadow_mask)
                     
-                resp = {
-                    "is_demo": is_demo,
-                    "alignment_info": align_info,
-                    "report": solar_report,
-                    "image_a_b64": encode_image_to_base64(img_a),
-                    "registered_b_b64": encode_image_to_base64(warped_b),
-                    "dem_aligned_b64": encode_image_to_base64(color_dem),
-                    "simulated_illum_b64": encode_image_to_base64(simulated_image),
-                    "shadow_mask_b64": encode_image_to_base64(shadow_vis),
-                    "overlay_b64": encode_image_to_base64(overlay_vis)
-                }
-                
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(json.dumps(resp).encode("utf-8"))
-            except Exception as e:
-                self.send_response(500)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(json.dumps({"error": str(e)}).encode("utf-8"))
-            return
+                    comparison_metrics = compare_with_registered_images(simulated_image, img_a, warped_b, shadow_mask)
+                    
+                    color_dem = create_colorized_dem(aligned_dem)
+                    shadow_vis = (shadow_mask * 255.0).astype(np.uint8)
+                    overlay_vis = create_comparison_overlay(img_a, simulated_image, "Image A (Ref)", "DEM Simulation")
+                    comp_b_vis = create_comparison_overlay(warped_b, simulated_image, "Warped Image B", "DEM Simulation")
+                    
+                    solar_report = {
+                        "module": "DEM-Based Solar Raycaster",
+                        "dem_status": align_info["status"],
+                        "is_demo": is_demo,
+                        "sun_azimuth_deg": round(azimuth_deg, 1),
+                        "sun_elevation_deg": round(elevation_deg, 1),
+                        "simulation_model": "Lambertian + terrain shadows",
+                        "similarity_with_image_a": comparison_metrics["similarity_image_a"],
+                        "similarity_with_warped_b": comparison_metrics["similarity_warped_b"],
+                        "shadow_overlap_score_pct": comparison_metrics["shadow_overlap_pct"],
+                        "mean_brightness_diff": comparison_metrics["mean_brightness_diff"],
+                        "interpretation": comparison_metrics["interpretation"],
+                        "alignment_warning": align_info["warning"]
+                    }
+                    
+                    out_dir = CURRENT_SESSION.get("output_dir", "results")
+                    os.makedirs(out_dir, exist_ok=True)
+                    
+                    cv2.imwrite(os.path.join(out_dir, "dem_aligned_to_reference.png"), color_dem)
+                    cv2.imwrite(os.path.join(out_dir, "simulated_illumination.png"), simulated_image)
+                    cv2.imwrite(os.path.join(out_dir, "simulated_shadow_mask.png"), shadow_vis)
+                    cv2.imwrite(os.path.join(out_dir, "comparison_with_image_a.png"), overlay_vis)
+                    cv2.imwrite(os.path.join(out_dir, "comparison_with_registered_b.png"), comp_b_vis)
+                    
+                    with open(os.path.join(out_dir, "solar_raycaster_report.json"), "w", encoding="utf-8") as f:
+                        json.dump(sanitize_json_object(solar_report), f, indent=2, cls=NumpyJSONEncoder)
+                        
+                    resp = {
+                        "error": False,
+                        "is_demo": is_demo,
+                        "alignment_info": align_info,
+                        "report": solar_report,
+                        "image_a_b64": safe_encode_image_to_base64(img_a),
+                        "registered_b_b64": safe_encode_image_to_base64(warped_b),
+                        "dem_aligned_b64": safe_encode_image_to_base64(color_dem),
+                        "simulated_illum_b64": safe_encode_image_to_base64(simulated_image),
+                        "shadow_mask_b64": safe_encode_image_to_base64(shadow_vis),
+                        "overlay_b64": safe_encode_image_to_base64(overlay_vis)
+                    }
+                    self.send_json_response(resp, status_code=200)
+                except ValueError as ve:
+                    self.send_json_response({"error": True, "message": str(ve)}, status_code=400)
+                except Exception as e:
+                    sys.stderr.write(f"DEM Raycaster error: {e}\n")
+                    self.send_json_response({"error": True, "message": f"DEM Raycaster error: {str(e)}"}, status_code=500)
+                return
 
-        self.send_response(404)
-        self.end_headers()
+            self.send_json_response({"error": True, "message": "Not Found"}, status_code=404)
+        except Exception as top_err:
+            sys.stderr.write(f"Unhandled request error: {top_err}\n")
+            self.send_json_response({"error": True, "message": "Internal Server Error"}, status_code=500)
 
 
 def run_server(port: int = 8080, host: str = "0.0.0.0"):
