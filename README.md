@@ -229,7 +229,7 @@ Source Image     → Moving
 ## 1. Clone the Repository
 
 ```bash
-git clone <YOUR-REPOSITORY-URL>
+git clone https://github.com/shivani1759/lunaalign/tree/main
 cd LunaAlign
 ```
 
